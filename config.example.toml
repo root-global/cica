@@ -32,9 +32,11 @@ bot_token = "123456:ABC-your-telegram-bot-token"
 # cica does not terminate TLS — put an ALB or a reverse proxy ahead of it — but
 # it always verifies the webhook signature itself.
 # [channels.linear]
-# access_token = "lin_oauth_..."   # OAuth app token (actor=app), NOT a personal key
+# client_id = "..."                # the OAuth application's client id
+# client_secret = "..."            # and secret; cica mints 30-day app-actor tokens from them
 # webhook_secret = "lin_wh_..."    # from the webhook's detail page
 # listen_addr = "0.0.0.0:8080"     # webhook at POST /webhooks/linear, health at GET /health
+# access_token = "..."             # local testing only: Linear's tokens expire in 24h
 
 # Memories are keyed <channel>_<user_id>, so the same human is a stranger on a
 # new channel. Map a Linear email onto the identity they already use elsewhere

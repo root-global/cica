@@ -452,8 +452,16 @@ fn default_linear_listen() -> String {
 /// POSTs an `AgentSessionEvent` webhook when the app is @mentioned on an issue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearConfig {
-    /// OAuth app token (`actor=app`), so activities are authored by the app user
-    /// rather than by whoever owns a personal API key.
+    /// The OAuth application's client credentials. Preferred: they mint 30-day
+    /// **app-actor** tokens on demand, so activities are authored by the app
+    /// user and nothing expires under a running channel.
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    /// A pre-minted access token. Accepted for local testing only — Linear's
+    /// authorization-code tokens last 24 hours, so a token pasted here stops
+    /// working after a day. Ignored when the client credentials are set.
     #[serde(default)]
     pub access_token: String,
     /// Webhook signing secret, from the webhook's detail page. Used to verify the
@@ -479,6 +487,8 @@ pub struct LinearConfig {
 impl Default for LinearConfig {
     fn default() -> Self {
         Self {
+            client_id: String::new(),
+            client_secret: String::new(),
             access_token: String::new(),
             webhook_secret: String::new(),
             listen_addr: default_linear_listen(),
@@ -491,12 +501,19 @@ impl Default for LinearConfig {
 }
 
 impl LinearConfig {
-    pub fn new(access_token: String, webhook_secret: String) -> Self {
+    pub fn new(client_id: String, client_secret: String, webhook_secret: String) -> Self {
         Self {
-            access_token,
+            client_id,
+            client_secret,
             webhook_secret,
             ..Default::default()
         }
+    }
+
+    /// True when the channel has some way to authenticate.
+    pub fn has_credential(&self) -> bool {
+        (!self.client_id.is_empty() && !self.client_secret.is_empty())
+            || !self.access_token.is_empty()
     }
 
     /// Resolve a Linear commenter to the identity their memories are keyed under.
@@ -682,6 +699,18 @@ impl Config {
         overlay_number!("CICA_TURN_TIMEOUT_SECS", turn_timeout_secs);
         overlay_number!("CICA_WORKER_CAP", worker_cap);
         overlay_number!("CICA_WORKER_MAX_AGE_SECS", worker_max_age_secs);
+        if let Some(v) = get("CICA_LINEAR_CLIENT_ID") {
+            self.channels
+                .linear
+                .get_or_insert_with(Default::default)
+                .client_id = v;
+        }
+        if let Some(v) = get("CICA_LINEAR_CLIENT_SECRET") {
+            self.channels
+                .linear
+                .get_or_insert_with(Default::default)
+                .client_secret = v;
+        }
         if let Some(v) = get("CICA_LINEAR_ACCESS_TOKEN") {
             self.channels
                 .linear
@@ -782,7 +811,7 @@ mod tests {
     use super::*;
 
     fn linear_with_mapping() -> LinearConfig {
-        let mut config = LinearConfig::new("token".into(), "secret".into());
+        let mut config = LinearConfig::new("id".into(), "secret".into(), "wh".into());
         config
             .identity
             .insert("rodrigo@rootglobal.io".into(), "slack:U0123ABC".into());
@@ -823,7 +852,7 @@ mod tests {
 
     #[test]
     fn a_malformed_mapping_falls_back_rather_than_producing_half_an_identity() {
-        let mut config = LinearConfig::new("token".into(), "secret".into());
+        let mut config = LinearConfig::new("id".into(), "secret".into(), "wh".into());
         config.identity.insert("a@b.c".into(), "slack".into());
         config.identity.insert("d@e.f".into(), "slack:".into());
         config.identity.insert("g@h.i".into(), ":U1".into());
@@ -835,6 +864,27 @@ mod tests {
                 "{email} should not produce a partial identity"
             );
         }
+    }
+
+    #[test]
+    fn a_credential_is_either_the_client_pair_or_a_static_token() {
+        assert!(!LinearConfig::default().has_credential());
+
+        let pair = LinearConfig::new("id".into(), "secret".into(), "wh".into());
+        assert!(pair.has_credential());
+
+        // Half a pair is not a credential.
+        let half = LinearConfig {
+            client_id: "id".into(),
+            ..Default::default()
+        };
+        assert!(!half.has_credential());
+
+        let static_only = LinearConfig {
+            access_token: "lin_static".into(),
+            ..Default::default()
+        };
+        assert!(static_only.has_credential());
     }
 
     #[test]
