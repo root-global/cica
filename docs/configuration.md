@@ -58,6 +58,58 @@ Configure one or more. A channel section's presence is what enables it.
 | `onboarding_prompt` | string | — | Per-channel override. |
 | `unfurl_links` | bool | `false` | Let Slack preview links in bot messages. |
 
+### `[channels.linear]`
+
+The one **inbound** channel. Telegram long-polls, Slack uses Socket Mode, Signal
+talks to a local daemon — Linear POSTs an `AgentSessionEvent` webhook when the
+app is `@mentioned` on an issue, so cica opens a listening port.
+
+cica never terminates TLS: put an ALB or a reverse proxy in front and point it
+at `listen_addr`. cica verifies the `Linear-Signature` HMAC itself regardless,
+and refuses to start if `webhook_secret` is empty.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `access_token` | string | — | OAuth app token installed with `actor=app`, so activities are authored by the app user rather than a person. |
+| `webhook_secret` | string | — | Webhook signing secret. Required — cica will not listen unverified. |
+| `listen_addr` | string | `"0.0.0.0:8080"` | Where the listener binds. Webhook at `POST /webhooks/linear`, health check at `GET /health`. |
+| `auto_approve` | bool | `false` | Auto-approve new users. |
+| `shared_identity` | bool | `false` | Use shared `PERSONA.md`. |
+| `onboarding_prompt` | string | — | Per-channel override. |
+
+All three keys also have an env form, for deployments that would rather not
+write secrets into `config.toml`: `CICA_LINEAR_ACCESS_TOKEN`,
+`CICA_LINEAR_WEBHOOK_SECRET`, `CICA_LINEAR_LISTEN_ADDR`.
+
+#### `[channels.linear.identity]`
+
+Memories and `USER.md` are keyed `<channel>_<user_id>`, so the same human is a
+stranger the first time they appear on a new channel. This table maps a Linear
+account's email onto an identity elsewhere, so their memories, preferences and
+pairing carry over:
+
+```toml
+[channels.linear.identity]
+"rodrigo@example.com" = "slack:U0123ABC"
+```
+
+Matching is case-insensitive. An unmapped person becomes `linear:<their user
+id>` and goes through the normal pairing flow.
+
+#### Setting up the Linear side
+
+1. Create an OAuth application at `https://linear.app/settings/api/applications/new`.
+2. Install it with `actor=app` appended to the authorization URL. This creates
+   an app user in the workspace; everything the agent writes is authored by it.
+3. Scopes: `app:mentionable`, plus `read` and `write`. Leave `app:assignable`
+   off unless you want the agent delegated whole issues — assignment in Linear
+   reads as "you own this now", which is a different promise from "answer this".
+4. Add a webhook subscribed to **Agent session events**, pointed at
+   `https://<your-host>/webhooks/linear`.
+
+A turn is keyed to the **issue**, not the agent session, so a mention next week
+resumes the same conversation rather than starting cold.
+
 ## Backends
 
 ### `[claude]`

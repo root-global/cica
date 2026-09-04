@@ -36,6 +36,11 @@ pub enum Affinity {
     Cron {
         job_id: String,
     },
+    /// One warm worker per Linear issue: a ticket is a conversation that can be
+    /// picked up days later, so affinity follows the issue rather than a user.
+    LinearIssue {
+        issue_id: String,
+    },
 }
 
 impl Affinity {
@@ -47,6 +52,7 @@ impl Affinity {
                 thread_ts,
             } => (1, vec![channel_id, thread_ts]),
             Self::Cron { job_id } => (2, vec![job_id]),
+            Self::LinearIssue { issue_id } => (3, vec![issue_id]),
         };
         let mut bytes = vec![tag];
         for field in fields {
