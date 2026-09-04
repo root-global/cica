@@ -29,7 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
@@ -42,6 +42,8 @@ use crate::runtime::Runtime;
 use crate::sandbox::Affinity;
 
 const LINEAR_API: &str = "https://api.linear.app/graphql";
+const LINEAR_TOKEN_URL: &str = "https://api.linear.app/oauth/token";
+const LINEAR_SCOPES: &str = "read,write,comments:create,issues:create,app:mentionable";
 
 /// How far a `webhookTimestamp` may be from our own clock. Linear's own guidance
 /// is one minute; being stricter would make us fragile to ordinary clock skew.
@@ -312,19 +314,136 @@ mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
 }
 "#;
 
+/// How Linear requests are authorized.
+///
+/// Linear's OAuth tokens are short-lived: the authorization-code flow issues
+/// 24-hour tokens, so a token pasted into a config file stops working after a
+/// day and the channel goes quiet. The `client_credentials` grant instead
+/// returns a 30-day **app-actor** token with no refresh token, so the channel
+/// holds the client credentials and mints tokens as needed.
+///
+/// A static token is still accepted, because it is what makes local testing
+/// against a personal key possible — it simply cannot renew itself.
+enum Credential {
+    Static(String),
+    ClientCredentials {
+        client_id: String,
+        client_secret: String,
+        cached: tokio::sync::RwLock<Option<CachedToken>>,
+    },
+}
+
+struct CachedToken {
+    token: String,
+    /// When to mint a replacement. Deliberately earlier than the real expiry —
+    /// a turn that starts just before the token dies must still finish.
+    renew_after: Instant,
+}
+
+/// Renew this far ahead of expiry. A turn runs 40-200s; an hour is generous
+/// enough that no in-flight turn can be holding a token that expires under it.
+const TOKEN_RENEW_MARGIN: Duration = Duration::from_secs(3600);
+
+impl Credential {
+    async fn token(&self, http: &reqwest::Client) -> Result<String> {
+        match self {
+            Self::Static(token) => Ok(token.clone()),
+            Self::ClientCredentials {
+                client_id,
+                client_secret,
+                cached,
+            } => {
+                if let Some(current) = cached.read().await.as_ref()
+                    && Instant::now() < current.renew_after
+                {
+                    return Ok(current.token.clone());
+                }
+
+                let mut guard = cached.write().await;
+                // Another task may have minted one while we waited for the lock.
+                if let Some(current) = guard.as_ref()
+                    && Instant::now() < current.renew_after
+                {
+                    return Ok(current.token.clone());
+                }
+
+                let (token, expires_in) = mint_app_token(http, client_id, client_secret).await?;
+                let renew_after = Instant::now()
+                    + expires_in
+                        .checked_sub(TOKEN_RENEW_MARGIN)
+                        .unwrap_or(expires_in / 2);
+                info!(
+                    "Minted a Linear app token, renewing in {}h",
+                    (renew_after - Instant::now()).as_secs() / 3600
+                );
+                *guard = Some(CachedToken {
+                    token: token.clone(),
+                    renew_after,
+                });
+                Ok(token)
+            }
+        }
+    }
+}
+
+/// Exchange client credentials for an app-actor access token.
+async fn mint_app_token(
+    http: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<(String, Duration)> {
+    let response = http
+        .post(LINEAR_TOKEN_URL)
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("grant_type", "client_credentials"),
+            ("scope", LINEAR_SCOPES),
+        ])
+        .send()
+        .await
+        .context("requesting a Linear app token")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        // Deliberately does not include the body: a rejected token request can
+        // quote back the credentials it was given.
+        anyhow::bail!("Linear rejected the client credentials ({status})");
+    }
+
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .context("reading the Linear token response")?;
+    let token = payload
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Linear returned no access_token"))?
+        .to_string();
+    // Linear currently returns 30 days. Fall back to an hour rather than
+    // trusting a missing field, so a surprise means "renew often", not "never".
+    let expires_in = Duration::from_secs(
+        payload
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3600),
+    );
+    Ok((token, expires_in))
+}
+
 /// Minimal GraphQL client. cica already depends on `reqwest`; a generated
 /// client for one mutation would be more machinery than the job needs.
 #[derive(Clone)]
 struct LinearApi {
     http: reqwest::Client,
-    access_token: String,
+    credential: Arc<Credential>,
 }
 
 impl LinearApi {
-    fn new(access_token: String) -> Self {
+    fn new(credential: Credential) -> Self {
         Self {
             http: reqwest::Client::new(),
-            access_token,
+            credential: Arc::new(credential),
         }
     }
 
@@ -335,10 +454,11 @@ impl LinearApi {
         body: &str,
         ephemeral: bool,
     ) -> Result<()> {
+        let token = self.credential.token(&self.http).await?;
         let response = self
             .http
             .post(LINEAR_API)
-            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&json!({
                 "query": ACTIVITY_MUTATION,
                 "variables": activity_variables(session_id, kind, body, ephemeral),
@@ -450,8 +570,10 @@ struct AppState {
 }
 
 pub async fn run(config: LinearConfig, rt: Arc<Runtime>) -> Result<()> {
-    if config.access_token.is_empty() {
-        anyhow::bail!("[channels.linear] access_token is empty");
+    if !config.has_credential() {
+        anyhow::bail!(
+            "[channels.linear] needs client_id + client_secret (preferred) or access_token"
+        );
     }
     if config.webhook_secret.is_empty() {
         // Refusing to start is deliberate: an unverified inbound endpoint on the
@@ -461,7 +583,7 @@ pub async fn run(config: LinearConfig, rt: Arc<Runtime>) -> Result<()> {
 
     let listen_addr = config.listen_addr.clone();
     let state = AppState {
-        api: LinearApi::new(config.access_token.clone()),
+        api: LinearApi::new(credential_from(&config)),
         config: Arc::new(config),
         rt,
     };
@@ -481,6 +603,25 @@ pub async fn run(config: LinearConfig, rt: Arc<Runtime>) -> Result<()> {
         .context("Linear webhook listener stopped")?;
 
     Ok(())
+}
+
+/// Prefer the client credentials: they renew. A static token is a testing
+/// affordance and cannot.
+fn credential_from(config: &LinearConfig) -> Credential {
+    if !config.client_id.is_empty() && !config.client_secret.is_empty() {
+        Credential::ClientCredentials {
+            client_id: config.client_id.clone(),
+            client_secret: config.client_secret.clone(),
+            cached: tokio::sync::RwLock::new(None),
+        }
+    } else {
+        warn!(
+            "Linear is using a static access_token; Linear's OAuth tokens expire \
+             (24h for authorization-code grants), so set client_id and client_secret \
+             for anything long-running."
+        );
+        Credential::Static(config.access_token.clone())
+    }
 }
 
 /// Load-balancer health check. Deliberately says nothing about the workspace,
@@ -603,13 +744,16 @@ async fn handle_invocation(state: AppState, invocation: Invocation) -> Result<()
     Ok(())
 }
 
-/// Validate an access token; returns the app user's display name on success.
-/// `viewer` on an `actor=app` token resolves to the app user, which is exactly
-/// the identity whose name will appear on every activity.
-pub async fn validate_token(access_token: &str) -> Result<String> {
-    let response = reqwest::Client::new()
+/// Validate credentials; returns the app user's display name on success.
+/// `viewer` on an app-actor token resolves to the app user, which is exactly the
+/// identity whose name will appear on every activity — so this both proves the
+/// credentials work and shows the operator who Linear thinks they are.
+pub async fn validate_credentials(client_id: &str, client_secret: &str) -> Result<String> {
+    let http = reqwest::Client::new();
+    let (token, _) = mint_app_token(&http, client_id, client_secret).await?;
+    let response = http
         .post(LINEAR_API)
-        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Authorization", format!("Bearer {token}"))
         .json(&json!({ "query": "query Me { viewer { id name } }" }))
         .send()
         .await
@@ -628,8 +772,8 @@ pub async fn validate_token(access_token: &str) -> Result<String> {
 }
 
 /// Post an activity outside a turn — used by the cron result sender.
-pub async fn send_activity(access_token: &str, session_id: &str, message: &str) -> Result<()> {
-    LinearApi::new(access_token.to_string())
+pub async fn send_activity(config: &LinearConfig, session_id: &str, message: &str) -> Result<()> {
+    LinearApi::new(credential_from(config))
         .create_activity(session_id, ActivityKind::Response, message, false)
         .await
 }
@@ -820,6 +964,103 @@ mod tests {
         let error = activity_variables("s1", ActivityKind::Error, "boom", false);
         assert_eq!(error["input"]["content"]["type"], "error");
         assert_eq!(error["input"]["agentSessionId"], "s1");
+    }
+
+    #[tokio::test]
+    async fn a_static_credential_is_returned_as_is() {
+        let http = reqwest::Client::new();
+        let cred = Credential::Static("lin_static".into());
+        assert_eq!(cred.token(&http).await.unwrap(), "lin_static");
+        // Repeated reads must not drift; a static token has nothing to renew.
+        assert_eq!(cred.token(&http).await.unwrap(), "lin_static");
+    }
+
+    #[tokio::test]
+    async fn a_cached_token_is_reused_until_its_renewal_deadline() {
+        let http = reqwest::Client::new();
+        let cred = Credential::ClientCredentials {
+            // Deliberately unusable: if the cache is honoured these are never
+            // exercised, so a network call here would fail the test.
+            client_id: "unused".into(),
+            client_secret: "unused".into(),
+            cached: tokio::sync::RwLock::new(Some(CachedToken {
+                token: "cached".into(),
+                renew_after: Instant::now() + Duration::from_secs(600),
+            })),
+        };
+        assert_eq!(cred.token(&http).await.unwrap(), "cached");
+    }
+
+    #[tokio::test]
+    async fn an_expired_cache_entry_is_not_served() {
+        let http = reqwest::Client::new();
+        let cred = Credential::ClientCredentials {
+            client_id: "bogus".into(),
+            client_secret: "bogus".into(),
+            cached: tokio::sync::RwLock::new(Some(CachedToken {
+                token: "stale".into(),
+                renew_after: Instant::now() - Duration::from_secs(1),
+            })),
+        };
+        // Past the deadline it must try to mint rather than hand back `stale`.
+        // Minting with bogus credentials fails, and failing is the correct
+        // outcome here -- what must not happen is a stale token being served.
+        if let Ok(token) = cred.token(&http).await {
+            panic!("served a token past its renewal deadline: {token}");
+        }
+    }
+
+    #[test]
+    fn the_renewal_deadline_sits_before_the_real_expiry() {
+        // A 30-day token renews an hour early; the margin exists so a turn in
+        // flight cannot be holding a token that dies under it.
+        let thirty_days = Duration::from_secs(30 * 24 * 3600);
+        let margin = thirty_days
+            .checked_sub(TOKEN_RENEW_MARGIN)
+            .unwrap_or(thirty_days / 2);
+        assert!(margin < thirty_days);
+        assert_eq!(margin, thirty_days - Duration::from_secs(3600));
+
+        // A token shorter than the margin must still renew early, not overflow
+        // into "renew immediately, forever".
+        let five_minutes = Duration::from_secs(300);
+        let fallback = five_minutes
+            .checked_sub(TOKEN_RENEW_MARGIN)
+            .unwrap_or(five_minutes / 2);
+        assert_eq!(fallback, Duration::from_secs(150));
+    }
+
+    /// Hits the live Linear API. Ignored by default; run it against a real
+    /// OAuth application when changing the token exchange:
+    ///
+    /// ```text
+    /// CICA_LINEAR_CLIENT_ID=... CICA_LINEAR_CLIENT_SECRET=... \
+    ///   cargo test --all-features mints_a_real_app_token -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires live Linear credentials"]
+    async fn mints_a_real_app_token_and_it_resolves_to_the_app_user() {
+        let client_id = std::env::var("CICA_LINEAR_CLIENT_ID").expect("CICA_LINEAR_CLIENT_ID");
+        let client_secret =
+            std::env::var("CICA_LINEAR_CLIENT_SECRET").expect("CICA_LINEAR_CLIENT_SECRET");
+
+        let http = reqwest::Client::new();
+        let (token, expires_in) = mint_app_token(&http, &client_id, &client_secret)
+            .await
+            .expect("minting an app token");
+        assert!(!token.is_empty());
+        // Client-credentials tokens are 30 days; anything under a day means the
+        // grant changed and the renewal margin needs revisiting.
+        assert!(
+            expires_in > Duration::from_secs(86_400),
+            "expires_in unexpectedly short: {expires_in:?}"
+        );
+
+        let name = validate_credentials(&client_id, &client_secret)
+            .await
+            .expect("viewer lookup");
+        println!("app token expires_in={expires_in:?}, viewer={name}");
+        assert!(!name.is_empty());
     }
 
     #[test]

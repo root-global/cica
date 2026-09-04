@@ -863,9 +863,10 @@ async fn setup_linear(existing_config: Option<Config>) -> Result<Config> {
     println!("1. Create an OAuth application:");
     println!("   https://linear.app/settings/api/applications/new");
     println!();
-    println!("2. Install it with actor=app, so activities are authored by the app");
-    println!("   rather than by whoever owns a personal API key. Append");
-    println!("   'actor=app' to the authorization URL.");
+    println!("2. Note its Client ID and Client Secret. cica exchanges them for a");
+    println!("   30-day app-actor token whenever it needs one, so activities are");
+    println!("   authored by the app rather than by a person, and nothing expires");
+    println!("   under a running channel. (Authorization-code tokens last only 24h.)");
     println!();
     println!("3. Scopes:");
     println!("   - app:mentionable   (be @mentioned on issues)");
@@ -877,8 +878,12 @@ async fn setup_linear(existing_config: Option<Config>) -> Result<Config> {
     println!("   https://<your-host>/webhooks/linear");
     println!();
 
-    let access_token: String = Password::with_theme(&ColorfulTheme::default())
-        .with_prompt("Paste the OAuth app access token")
+    let client_id: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Paste the OAuth application's Client ID")
+        .interact_text()?;
+
+    let client_secret: String = Password::with_theme(&ColorfulTheme::default())
+        .with_prompt("Paste the Client Secret")
         .interact()?;
 
     let webhook_secret: String = Password::with_theme(&ColorfulTheme::default())
@@ -893,7 +898,7 @@ async fn setup_linear(existing_config: Option<Config>) -> Result<Config> {
     print!("Validating... ");
     std::io::Write::flush(&mut std::io::stdout())?;
 
-    match channels::linear::validate_token(&access_token).await {
+    match channels::linear::validate_credentials(&client_id, &client_secret).await {
         Ok(name) => {
             println!("OK");
             println!("Connected as: {}", name);
@@ -904,7 +909,7 @@ async fn setup_linear(existing_config: Option<Config>) -> Result<Config> {
         }
     }
 
-    let mut linear = LinearConfig::new(access_token, webhook_secret);
+    let mut linear = LinearConfig::new(client_id, client_secret, webhook_secret);
     linear.listen_addr = listen_addr;
 
     let mut config = existing_config.unwrap_or_default();
