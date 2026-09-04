@@ -58,6 +58,78 @@ Configure one or more. A channel section's presence is what enables it.
 | `onboarding_prompt` | string | — | Per-channel override. |
 | `unfurl_links` | bool | `false` | Let Slack preview links in bot messages. |
 
+### `[channels.linear]`
+
+The one **inbound** channel. Telegram long-polls, Slack uses Socket Mode, Signal
+talks to a local daemon — Linear POSTs an `AgentSessionEvent` webhook when the
+app is `@mentioned` on an issue, so cica opens a listening port.
+
+cica never terminates TLS: put an ALB or a reverse proxy in front and point it
+at `listen_addr`. cica verifies the `Linear-Signature` HMAC itself regardless,
+and refuses to start if `webhook_secret` is empty.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `client_id` | string | — | The OAuth application's client id. |
+| `client_secret` | string | — | Its client secret. cica exchanges the pair for a 30-day **app-actor** token whenever it needs one. |
+| `access_token` | string | — | A pre-minted token. Local testing only — see the note below. |
+| `webhook_secret` | string | — | Webhook signing secret. Required — cica will not listen unverified. |
+| `listen_addr` | string | `"0.0.0.0:8080"` | Where the listener binds. Webhook at `POST /webhooks/linear`, health check at `GET /health`. |
+| `auto_approve` | bool | `false` | Auto-approve new users. |
+| `shared_identity` | bool | `false` | Use shared `PERSONA.md`. |
+| `onboarding_prompt` | string | — | Per-channel override. |
+
+Every key also has an env form, for deployments that would rather not write
+secrets into `config.toml`: `CICA_LINEAR_CLIENT_ID`,
+`CICA_LINEAR_CLIENT_SECRET`, `CICA_LINEAR_ACCESS_TOKEN`,
+`CICA_LINEAR_WEBHOOK_SECRET`, `CICA_LINEAR_LISTEN_ADDR`.
+
+> **Use the client credentials, not a token.** Linear's OAuth tokens are
+> short-lived: the authorization-code flow issues **24-hour** tokens, so a token
+> pasted into `access_token` stops working after a day and the channel goes
+> quiet with nothing but a 401 in the log. The `client_credentials` grant returns
+> a **30-day** app-actor token and no refresh token, so cica holds the client id
+> and secret and mints tokens on demand, renewing an hour before expiry. Set
+> `access_token` only for a throwaway local test; the channel logs a warning when
+> it falls back to one.
+
+#### `[channels.linear.identity]`
+
+Memories and `USER.md` are keyed `<channel>_<user_id>`, so the same human is a
+stranger the first time they appear on a new channel. This table maps a Linear
+account's email onto an identity elsewhere, so their memories, preferences and
+pairing carry over:
+
+```toml
+[channels.linear.identity]
+"rodrigo@example.com" = "slack:U0123ABC"
+```
+
+Matching is case-insensitive. An unmapped person becomes `linear:<their user
+id>` and goes through the normal pairing flow.
+
+#### Setting up the Linear side
+
+1. Create an OAuth application at `https://linear.app/settings/api/applications/new`.
+2. Copy its **Client ID** and **Client Secret** into `client_id` / `client_secret`.
+   The app-actor token cica mints from them creates and acts as an app user in the
+   workspace, so everything the agent writes is authored by it rather than by a
+   colleague.
+3. Scopes are requested per authorization, not configured on the app. cica asks
+   for `read,write,comments:create,issues:create,app:mentionable`. It does **not**
+   ask for `app:assignable`: assignment in Linear reads as "you own this now",
+   which is a different promise from "answer this". Add it only if you want the
+   agent delegated whole issues.
+4. Add a webhook subscribed to **Agent session events**, pointed at
+   `https://<your-host>/webhooks/linear`, and copy its signing secret into
+   `webhook_secret`.
+
+`cica init` walks through this and validates the credentials by resolving
+`viewer`, which prints the name that will appear on every activity.
+
+A turn is keyed to the **issue**, not the agent session, so a mention next week
+resumes the same conversation rather than starting cold.
+
 ## Backends
 
 ### `[claude]`
