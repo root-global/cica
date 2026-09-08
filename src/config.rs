@@ -459,9 +459,21 @@ pub struct LinearConfig {
     pub client_id: String,
     #[serde(default)]
     pub client_secret: String,
+    /// The refresh token from an `actor=app` authorization-code install. This is
+    /// the credential a long-running agent should use: Linear's own guidance is
+    /// that `client_credentials` tokens are minted per run and not persisted,
+    /// and the agent's identity comes from the installation rather than from a
+    /// client-credentials grant.
+    ///
+    /// Seed value only. Linear **rotates** the refresh token on every use, so
+    /// the live one is kept beside it on disk and this field is just what to
+    /// start from on a fresh deployment.
+    #[serde(default)]
+    pub refresh_token: String,
     /// A pre-minted access token. Accepted for local testing only — Linear's
     /// authorization-code tokens last 24 hours, so a token pasted here stops
-    /// working after a day. Ignored when the client credentials are set.
+    /// working after a day. Ignored when a refresh token or client credentials
+    /// are set.
     #[serde(default)]
     pub access_token: String,
     /// Webhook signing secret, from the webhook's detail page. Used to verify the
@@ -489,6 +501,7 @@ impl Default for LinearConfig {
         Self {
             client_id: String::new(),
             client_secret: String::new(),
+            refresh_token: String::new(),
             access_token: String::new(),
             webhook_secret: String::new(),
             listen_addr: default_linear_listen(),
@@ -514,6 +527,12 @@ impl LinearConfig {
     pub fn has_credential(&self) -> bool {
         (!self.client_id.is_empty() && !self.client_secret.is_empty())
             || !self.access_token.is_empty()
+    }
+
+    /// True when the client credentials can be used to refresh an installed
+    /// agent's token, rather than to mint a fresh client-credentials one.
+    pub fn can_refresh(&self) -> bool {
+        !self.client_id.is_empty() && !self.client_secret.is_empty()
     }
 
     /// Resolve a Linear commenter to the identity their memories are keyed under.
@@ -710,6 +729,12 @@ impl Config {
                 .linear
                 .get_or_insert_with(Default::default)
                 .client_secret = v;
+        }
+        if let Some(v) = get("CICA_LINEAR_REFRESH_TOKEN") {
+            self.channels
+                .linear
+                .get_or_insert_with(Default::default)
+                .refresh_token = v;
         }
         if let Some(v) = get("CICA_LINEAR_ACCESS_TOKEN") {
             self.channels

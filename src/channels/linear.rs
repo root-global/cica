@@ -326,11 +326,58 @@ mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
 /// against a personal key possible — it simply cannot renew itself.
 enum Credential {
     Static(String),
+    /// The installed agent's own credential: an authorization-code grant taken
+    /// with `actor=app`, renewed with its refresh token. This is what a
+    /// long-running agent should hold — Linear mints client-credentials tokens
+    /// per run and says not to persist them, and the agent's identity comes
+    /// from the installation.
+    Refreshing {
+        client_id: String,
+        client_secret: String,
+        /// Linear rotates the refresh token on every use, so the live one lives
+        /// on disk rather than in config: a restart must not fall back to a
+        /// spent token. Writes are atomic, and Linear allows replaying a
+        /// refresh for 30 minutes, which covers a crash between the exchange
+        /// and the write.
+        store: RefreshTokenStore,
+        cached: tokio::sync::RwLock<Option<CachedToken>>,
+    },
     ClientCredentials {
         client_id: String,
         client_secret: String,
         cached: tokio::sync::RwLock<Option<CachedToken>>,
     },
+}
+
+/// The rotating refresh token, kept beside cica's other internal state.
+struct RefreshTokenStore {
+    path: std::path::PathBuf,
+    /// Config's value, used only until the first rotation lands on disk.
+    seed: String,
+}
+
+impl RefreshTokenStore {
+    fn current(&self) -> String {
+        match std::fs::read_to_string(&self.path) {
+            Ok(token) if !token.trim().is_empty() => token.trim().to_string(),
+            _ => self.seed.clone(),
+        }
+    }
+
+    fn save(&self, token: &str) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::atomic::write(&self.path, token.as_bytes())
+            .with_context(|| format!("persisting the Linear refresh token to {:?}", self.path))?;
+        // The file is a live credential; keep it off other local accounts.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
 }
 
 struct CachedToken {
@@ -348,6 +395,60 @@ impl Credential {
     async fn token(&self, http: &reqwest::Client) -> Result<String> {
         match self {
             Self::Static(token) => Ok(token.clone()),
+            Self::Refreshing {
+                client_id,
+                client_secret,
+                store,
+                cached,
+            } => {
+                if let Some(current) = cached.read().await.as_ref()
+                    && Instant::now() < current.renew_after
+                {
+                    return Ok(current.token.clone());
+                }
+
+                let mut guard = cached.write().await;
+                if let Some(current) = guard.as_ref()
+                    && Instant::now() < current.renew_after
+                {
+                    return Ok(current.token.clone());
+                }
+
+                let refresh = store.current();
+                if refresh.is_empty() {
+                    anyhow::bail!(
+                        "no Linear refresh token; re-run the actor=app authorization for this app"
+                    );
+                }
+
+                let (token, expires_in, rotated) =
+                    refresh_app_token(http, client_id, client_secret, &refresh).await?;
+
+                // Persist the rotated token before serving the access token, so
+                // a crash cannot leave us holding one we can no longer renew.
+                if let Some(rotated) = rotated.filter(|r| r != &refresh)
+                    && let Err(e) = store.save(&rotated)
+                {
+                    // Not fatal: Linear allows replaying the previous refresh
+                    // for 30 minutes, so this turn still works and the next
+                    // attempt retries. But it will become fatal if it persists.
+                    warn!("Could not persist the rotated Linear refresh token: {e}");
+                }
+
+                let renew_after = Instant::now()
+                    + expires_in
+                        .checked_sub(TOKEN_RENEW_MARGIN)
+                        .unwrap_or(expires_in / 2);
+                info!(
+                    "Refreshed the Linear app token, renewing in {}h",
+                    (renew_after - Instant::now()).as_secs() / 3600
+                );
+                *guard = Some(CachedToken {
+                    token: token.clone(),
+                    renew_after,
+                });
+                Ok(token)
+            }
             Self::ClientCredentials {
                 client_id,
                 client_secret,
@@ -384,6 +485,58 @@ impl Credential {
             }
         }
     }
+}
+
+/// Renew the installed agent's access token. Returns the token, its lifetime,
+/// and the rotated refresh token when Linear issues one.
+async fn refresh_app_token(
+    http: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<(String, Duration, Option<String>)> {
+    let response = http
+        .post(LINEAR_TOKEN_URL)
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await
+        .context("refreshing the Linear app token")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        // No body: a rejected exchange can quote the credentials back. The
+        // remedy is an operator action, so say what it is.
+        anyhow::bail!(
+            "Linear rejected the refresh token ({status}); \
+             re-run the actor=app authorization to reinstall the agent"
+        );
+    }
+
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .context("reading the Linear refresh response")?;
+    let token = payload
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Linear returned no access_token"))?
+        .to_string();
+    let expires_in = Duration::from_secs(
+        payload
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3600),
+    );
+    let rotated = payload
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok((token, expires_in, rotated))
 }
 
 /// Exchange client credentials for an app-actor access token.
@@ -583,7 +736,7 @@ pub async fn run(config: LinearConfig, rt: Arc<Runtime>) -> Result<()> {
 
     let listen_addr = config.listen_addr.clone();
     let state = AppState {
-        api: LinearApi::new(credential_from(&config)),
+        api: LinearApi::new(credential_from(&config, &rt.paths)),
         config: Arc::new(config),
         rt,
     };
@@ -605,23 +758,49 @@ pub async fn run(config: LinearConfig, rt: Arc<Runtime>) -> Result<()> {
     Ok(())
 }
 
-/// Prefer the client credentials: they renew. A static token is a testing
-/// affordance and cannot.
-fn credential_from(config: &LinearConfig) -> Credential {
-    if !config.client_id.is_empty() && !config.client_secret.is_empty() {
-        Credential::ClientCredentials {
+/// Pick how this channel authenticates, most durable first.
+///
+/// A long-running agent wants the installation's own credential, refreshed:
+/// Linear mints client-credentials tokens per run and says not to persist them,
+/// and it was a live client-credentials token that blocked the `actor=app`
+/// install from completing in the first place. Client credentials remain
+/// supported for deployments that are not an installed agent; a static token is
+/// a testing affordance and cannot renew itself.
+fn credential_from(config: &LinearConfig, paths: &crate::config::Paths) -> Credential {
+    let store = RefreshTokenStore {
+        path: paths.internal_dir.join("linear_refresh_token"),
+        seed: config.refresh_token.clone(),
+    };
+
+    if config.can_refresh() && !store.current().is_empty() {
+        return Credential::Refreshing {
+            client_id: config.client_id.clone(),
+            client_secret: config.client_secret.clone(),
+            store,
+            cached: tokio::sync::RwLock::new(None),
+        };
+    }
+
+    if config.can_refresh() {
+        warn!(
+            "Linear has client credentials but no refresh token, so it will mint \
+             client-credentials tokens. That is the per-run credential, not the \
+             installed agent's -- set refresh_token from an actor=app authorization \
+             for a long-running channel."
+        );
+        return Credential::ClientCredentials {
             client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
             cached: tokio::sync::RwLock::new(None),
-        }
-    } else {
-        warn!(
-            "Linear is using a static access_token; Linear's OAuth tokens expire \
-             (24h for authorization-code grants), so set client_id and client_secret \
-             for anything long-running."
-        );
-        Credential::Static(config.access_token.clone())
+        };
     }
+
+    warn!(
+        "Linear is using a static access_token; Linear's OAuth tokens expire \
+         (24h for authorization-code grants), so set client_id, client_secret and \
+         refresh_token for anything long-running."
+    );
+    Credential::Static(config.access_token.clone())
 }
 
 /// Load-balancer health check. Deliberately says nothing about the workspace,
@@ -780,8 +959,13 @@ pub async fn validate_credentials(client_id: &str, client_secret: &str) -> Resul
 }
 
 /// Post an activity outside a turn — used by the cron result sender.
-pub async fn send_activity(config: &LinearConfig, session_id: &str, message: &str) -> Result<()> {
-    LinearApi::new(credential_from(config))
+pub async fn send_activity(
+    config: &LinearConfig,
+    paths: &crate::config::Paths,
+    session_id: &str,
+    message: &str,
+) -> Result<()> {
+    LinearApi::new(credential_from(config, paths))
         .create_activity(session_id, ActivityKind::Response, message, false)
         .await
 }
@@ -1069,6 +1253,85 @@ mod tests {
             .expect("viewer lookup");
         println!("app token expires_in={expires_in:?}, viewer={name}");
         assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn the_refresh_store_prefers_disk_over_the_config_seed() {
+        // Linear rotates the refresh token on every use, so config holds only a
+        // seed. Once a rotation lands, the seed is stale and must never win --
+        // that is how a restart ends up presenting a spent token.
+        let dir = tempfile::tempdir().unwrap();
+        let store = RefreshTokenStore {
+            path: dir.path().join("linear_refresh_token"),
+            seed: "seed-from-config".into(),
+        };
+        assert_eq!(store.current(), "seed-from-config");
+
+        store.save("rotated-once").unwrap();
+        assert_eq!(store.current(), "rotated-once");
+
+        store.save("rotated-twice").unwrap();
+        assert_eq!(store.current(), "rotated-twice");
+    }
+
+    #[test]
+    fn an_empty_or_blank_store_falls_back_to_the_seed() {
+        // A truncated write must not look like a valid empty token, or the
+        // channel would send "" and get an unexplained 400.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linear_refresh_token");
+        let store = RefreshTokenStore {
+            path: path.clone(),
+            seed: "seed".into(),
+        };
+        std::fs::write(&path, "   \n").unwrap();
+        assert_eq!(store.current(), "seed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_persisted_refresh_token_is_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = RefreshTokenStore {
+            path: dir.path().join("linear_refresh_token"),
+            seed: String::new(),
+        };
+        store.save("a-live-credential").unwrap();
+        let mode = std::fs::metadata(&store.path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "refresh token readable by other accounts");
+    }
+
+    #[test]
+    fn a_refreshing_credential_is_chosen_over_minting_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_t, paths) = crate::config::test_paths();
+
+        // Client credentials plus a refresh token: use the installation.
+        let mut config = LinearConfig::new("id".into(), "secret".into(), "wh".into());
+        config.refresh_token = "seed".into();
+        assert!(matches!(
+            credential_from(&config, &paths),
+            Credential::Refreshing { .. }
+        ));
+
+        // Client credentials alone: fall back to minting, with a warning.
+        let without = LinearConfig::new("id".into(), "secret".into(), "wh".into());
+        assert!(matches!(
+            credential_from(&without, &paths),
+            Credential::ClientCredentials { .. }
+        ));
+
+        // Neither: a static token is the last resort.
+        let static_only = LinearConfig {
+            access_token: "tok".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            credential_from(&static_only, &paths),
+            Credential::Static(_)
+        ));
+        drop(dir);
     }
 
     #[test]

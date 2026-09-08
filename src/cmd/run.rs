@@ -156,6 +156,7 @@ fn cron_result_sender(rt: &Runtime) -> crate::cron::ResultSender {
         .as_ref()
         .map(|c| c.bot_token.clone());
     let linear_config = rt.config.channels.linear.clone();
+    let linear_paths = rt.paths.clone();
 
     let result_sender: crate::cron::ResultSender =
         Arc::new(move |channel, user_id, target, message| {
@@ -163,6 +164,7 @@ fn cron_result_sender(rt: &Runtime) -> crate::cron::ResultSender {
             let signal_phone = signal_phone.clone();
             let slack_bot_token = slack_bot_token.clone();
             let linear_config = linear_config.clone();
+            let linear_paths = linear_paths.clone();
 
             Box::pin(async move {
                 match channel.as_str() {
@@ -198,8 +200,13 @@ fn cron_result_sender(rt: &Runtime) -> crate::cron::ResultSender {
                         if let Some(config) = linear_config {
                             // For Linear the "user id" a cron job carries is the
                             // agent session the activity belongs to.
-                            crate::channels::linear::send_activity(&config, &user_id, &message)
-                                .await
+                            crate::channels::linear::send_activity(
+                                &config,
+                                linear_paths.as_ref(),
+                                &user_id,
+                                &message,
+                            )
+                            .await
                         } else {
                             Err(anyhow::anyhow!("Linear not configured"))
                         }
