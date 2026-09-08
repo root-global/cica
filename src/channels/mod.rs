@@ -73,7 +73,6 @@ pub trait Channel: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub channel: String,
-    pub display_name: String,
     pub user_id: String,
 }
 
@@ -82,21 +81,15 @@ impl Identity {
     pub fn of(channel: &dyn Channel, user_id: &str) -> Self {
         Self {
             channel: channel.name().to_string(),
-            display_name: channel.display_name().to_string(),
             user_id: user_id.to_string(),
         }
     }
 
-    /// Attribute the turn to an identity on another channel.
+    /// Attribute the turn to an identity on another channel. Deliberately
+    /// carries no display name: which surface the user is looking at is the
+    /// `Channel`'s to say, not the identity's.
     pub fn mapped(channel: String, user_id: String) -> Self {
-        let display_name = get_channel_info(&channel)
-            .map(|c| c.display_name.to_string())
-            .unwrap_or_else(|| channel.clone());
-        Self {
-            channel,
-            display_name,
-            user_id,
-        }
+        Self { channel, user_id }
     }
 }
 
@@ -390,15 +383,21 @@ pub async fn execute_claude_query(
     let combined_text = messages.join("\n\n");
     let _typing = channel.start_typing();
 
-    // `identity` decides whose memories and profile this turn sees; `channel`
-    // only decides where the reply goes. They are the same for every channel
-    // that cannot recognise its users from elsewhere.
+    // `identity` decides whose memories and profile this turn sees; `channel` is
+    // where the conversation is actually happening. They are the same for every
+    // channel that cannot recognise its users from elsewhere.
+    //
+    // Keep them apart here. The display name feeds "You are currently
+    // communicating via X", which is about the surface in front of the user, so
+    // it must be the transport: a Linear mention attributed to someone's Slack
+    // identity is still a Linear conversation. Passing the identity's name here
+    // told the agent it was on Slack and it said so in a Linear ticket.
     let user_id = identity.user_id.as_str();
 
     let context_prompt = match onboarding::build_context_prompt_for_user(
         &rt.config,
         &rt.paths,
-        Some(&identity.display_name),
+        Some(channel.display_name()),
         Some(&identity.channel),
         Some(user_id),
         Some(&combined_text),
@@ -1334,25 +1333,32 @@ mod identity_tests {
     fn by_default_a_turn_is_attributed_to_the_channel_it_arrived_on() {
         let identity = Identity::of(&FakeChannel, "U1");
         assert_eq!(identity.channel, "slack");
-        assert_eq!(identity.display_name, "Slack");
         assert_eq!(identity.user_id, "U1");
     }
 
     #[test]
-    fn a_mapped_identity_carries_the_target_channels_display_name() {
+    fn a_mapped_identity_points_at_the_other_channels_memories() {
         // This is what lets a Linear mention read the person's Slack USER.md:
         // memories are keyed <channel>_<user_id>, so the channel has to be the
         // mapped one, not the transport the comment arrived on.
         let identity = Identity::mapped("slack".into(), "U0123ABC".into());
         assert_eq!(identity.channel, "slack");
-        assert_eq!(identity.display_name, "Slack");
         assert_eq!(identity.user_id, "U0123ABC");
     }
 
     #[test]
-    fn an_unknown_channel_still_gets_a_usable_display_name() {
-        let identity = Identity::mapped("matrix".into(), "@a:b".into());
-        assert_eq!(identity.display_name, "matrix");
+    fn a_mapped_identity_does_not_decide_which_surface_the_user_sees() {
+        // Regression: the identity used to carry a display name, which fed
+        // "You are currently communicating via X". A Linear mention mapped to
+        // a Slack identity therefore told the agent it was on Slack, and it
+        // wrote "from a Slack conversation" into a Linear ticket. The surface
+        // is the Channel's to report; the identity only says whose memories to
+        // load.
+        let identity = Identity::mapped("slack".into(), "U0123ABC".into());
+        assert_eq!(identity.channel, "slack");
+        assert_eq!(FakeChannel.display_name(), "Slack");
+        // Nothing on Identity can be mistaken for the surface name.
+        let _: &str = &identity.channel;
     }
 }
 
