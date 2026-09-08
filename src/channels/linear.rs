@@ -732,8 +732,16 @@ async fn handle_invocation(state: AppState, invocation: Invocation) -> Result<()
         state.rt.clone(),
         channel,
         &Identity::mapped(identity_channel, identity_user),
-        Affinity::LinearIssue {
-            issue_id: invocation.issue_id.clone(),
+        // Deliberately `Chat` keyed by issue rather than a new Affinity variant.
+        // Affinity is serialized into the TurnJob the worker deserializes, so a
+        // new variant is a breaking wire change: a router on this version would
+        // hand a job to a released worker that fails with "unknown variant" and
+        // the turn hangs until it times out. Router and worker are meant to be
+        // updatable in either order, so this keys the same one-warm-worker-per-
+        // issue behaviour using a shape every existing worker already accepts.
+        Affinity::Chat {
+            channel: "linear".to_string(),
+            user: invocation.issue_id.clone(),
         },
         vec![prompt],
         Some(session_key),
@@ -1061,6 +1069,44 @@ mod tests {
             .expect("viewer lookup");
         println!("app token expires_in={expires_in:?}, viewer={name}");
         assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn a_linear_turn_uses_an_affinity_released_workers_can_decode() {
+        // Affinity is serialized into the TurnJob that a worker deserializes.
+        // Workers run a released image which may predate the router, so adding
+        // an Affinity variant is a BREAKING WIRE CHANGE: the worker fails with
+        // "unknown variant", leaves the job consumed to prevent replay, and the
+        // turn hangs until it times out. This cost a live debugging session.
+        //
+        // If the match below stops compiling because you added a variant, that
+        // is the point: ship the worker image before the router, or key your
+        // affinity with a shape existing workers already accept.
+        let affinity = Affinity::Chat {
+            channel: "linear".to_string(),
+            user: "iss_abc".to_string(),
+        };
+        match &affinity {
+            Affinity::Chat { .. } | Affinity::SlackThread { .. } | Affinity::Cron { .. } => {}
+        }
+
+        let wire = serde_json::to_value(&affinity).unwrap();
+        assert!(
+            wire.get("Chat").is_some(),
+            "Linear turns must ride the Chat shape, got {wire}"
+        );
+
+        // Same issue, same worker; different issues, different workers.
+        let same = Affinity::Chat {
+            channel: "linear".to_string(),
+            user: "iss_abc".to_string(),
+        };
+        let other = Affinity::Chat {
+            channel: "linear".to_string(),
+            user: "iss_xyz".to_string(),
+        };
+        assert_eq!(affinity.id(), same.id());
+        assert_ne!(affinity.id(), other.id());
     }
 
     #[test]
