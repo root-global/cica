@@ -74,7 +74,7 @@ and refuses to start if `webhook_secret` is empty.
 |---|---|---|---|
 | `client_id` | string | — | The OAuth application's client id. |
 | `client_secret` | string | — | Its client secret. |
-| `refresh_token` | string | — | From an `actor=app` authorization-code install. **The credential a long-running agent should use.** Seed only — see below. |
+| `refresh_token` | string | — | Accepted and **ignored** — see below. |
 | `access_token` | string | — | A pre-minted token. Local testing only — see the note below. |
 | `webhook_secret` | string | — | Webhook signing secret. Required — cica will not listen unverified. |
 | `listen_addr` | string | `"0.0.0.0:8080"` | Where the listener binds. Webhook at `POST /webhooks/linear`, health check at `GET /health`. |
@@ -88,29 +88,26 @@ secrets into `config.toml`: `CICA_LINEAR_CLIENT_ID`,
 `CICA_LINEAR_ACCESS_TOKEN`, `CICA_LINEAR_WEBHOOK_SECRET`,
 `CICA_LINEAR_LISTEN_ADDR`.
 
-> **Which credential, and why it matters.** Linear's OAuth tokens are all
-> short-lived, and the three grants are not interchangeable:
+> **Which credential, and why it matters.** Use `client_id` + `client_secret`.
+> cica mints a 30-day app-actor token from them and renews an hour before expiry.
 >
-> * **`refresh_token` (preferred).** An agent's identity comes from its
->   *installation* — the `actor=app` authorization-code flow — and that grant
->   issues a 24-hour access token plus a refresh token. cica renews an hour
->   before expiry. Linear **rotates** the refresh token on every use, so the live
->   one is written atomically to `<internal>/linear_refresh_token` (mode 600) and
->   the config value is only a seed for a fresh deployment. Linear allows
->   replaying a refresh for 30 minutes, which covers a crash between the exchange
->   and the write.
-> * **`client_id` + `client_secret` alone.** Falls back to the
->   `client_credentials` grant: a 30-day app-actor token. Linear's guidance is to
->   mint these *per run* and not persist them, so this suits a CLI or a skill
->   rather than a long-running channel. cica warns when it takes this path.
-> * **`access_token`.** A pre-minted token for a throwaway local test. It cannot
->   renew itself, so the channel goes quiet after 24 hours with only a 401 in the
->   log. cica warns on startup.
+> A Linear app has a **single grant**. Minting a client-credentials token
+> revokes any outstanding authorization-code grant — access token *and* refresh
+> token. So a channel holding a refresh token loses it the moment anything else
+> authenticates as the same app (a CLI, a skill, a CI job), and the failure is
+> quiet: the turn completes, the work lands, and only the closing activity
+> fails, leaving the Linear session "running" forever. `refresh_token` is
+> therefore accepted and ignored, with a warning.
 >
-> **Operational gotcha.** A live `client_credentials` token blocks an `actor=app`
-> authorization from completing: Linear answers *"Scope updates are not supported
-> for client credentials tokens"*. If you need to re-authorize or change scopes,
-> revoke the outstanding tokens first — rotating the client secret does it.
+> `access_token` is for a throwaway local test only — it cannot renew, so the
+> channel goes quiet after 24 hours with a 401 in the log.
+>
+> **The `actor=app` installation is still required**, and is separate from the
+> credential: it is what makes Linear deliver agent webhooks at all. It is
+> one-time setup and survives minting. Note that a live client-credentials token
+> *blocks* an installation from completing (`Scope updates are not supported for
+> client credentials tokens`), so revoke outstanding tokens — rotating the client
+> secret does it — before installing or re-installing.
 
 #### `[channels.linear.identity]`
 

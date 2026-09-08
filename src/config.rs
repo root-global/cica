@@ -459,15 +459,13 @@ pub struct LinearConfig {
     pub client_id: String,
     #[serde(default)]
     pub client_secret: String,
-    /// The refresh token from an `actor=app` authorization-code install. This is
-    /// the credential a long-running agent should use: Linear's own guidance is
-    /// that `client_credentials` tokens are minted per run and not persisted,
-    /// and the agent's identity comes from the installation rather than from a
-    /// client-credentials grant.
+    /// Accepted and ignored.
     ///
-    /// Seed value only. Linear **rotates** the refresh token on every use, so
-    /// the live one is kept beside it on disk and this field is just what to
-    /// start from on a fresh deployment.
+    /// A Linear app has a single grant: minting a client-credentials token
+    /// revokes any outstanding authorization-code grant, so a channel holding a
+    /// refresh token loses it as soon as anything else authenticates as the
+    /// same app. Kept only so an existing config does not fail to parse; the
+    /// channel warns if it is set.
     #[serde(default)]
     pub refresh_token: String,
     /// A pre-minted access token. Accepted for local testing only — Linear's

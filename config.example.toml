@@ -34,9 +34,10 @@ bot_token = "123456:ABC-your-telegram-bot-token"
 # [channels.linear]
 # client_id = "..."                # the OAuth application's client id
 # client_secret = "..."            # and its secret
-# refresh_token = "..."            # from an actor=app install; preferred for a long-running
-#                                  # agent. Seed only: Linear rotates it, and cica keeps the
-#                                  # live one in <internal>/linear_refresh_token.
+#                                  # A Linear app has one grant: minting a client-credentials
+#                                  # token revokes any authorization-code grant, so
+#                                  # refresh_token is accepted and ignored. The actor=app
+#                                  # install is still required for webhook delivery.
 # webhook_secret = "lin_wh_..."    # from the webhook's detail page
 # listen_addr = "0.0.0.0:8080"     # webhook at POST /webhooks/linear, health at GET /health
 # access_token = "..."             # local testing only: Linear's tokens expire in 24h
